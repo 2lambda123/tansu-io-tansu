@@ -31,7 +31,7 @@ use tansu_kafka_sans_io::{
     describe_cluster_response::DescribeClusterBroker,
     metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
     record::{deflated, inflated, Header, Record},
-    to_system_time, to_timestamp, ErrorCode,
+    to_system_time, to_timestamp, ErrorCode, ScramMechanism,
 };
 use tokio_postgres::{error::SqlState, Config, NoTls};
 use tracing::{debug, error};
@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::{
     BrokerRegistationRequest, Error, ListOffsetRequest, ListOffsetResponse, MetadataResponse,
-    OffsetCommitRequest, OffsetStage, Result, Storage, TopicId, Topition,
+    OffsetCommitRequest, OffsetStage, Result, ScramCredential, Storage, TopicId, Topition,
 };
 
 const NULL_TOPIC_ID: [u8; 16] = [0; 16];
@@ -1263,6 +1263,87 @@ impl Storage for Postgres {
             brokers,
             topics: responses,
         })
+    }
+
+    async fn upsert_user_scram_credential(
+        &self,
+        username: &str,
+        mechanism: ScramMechanism,
+        credential: ScramCredential,
+    ) -> Result<()> {
+        let c = self.connection().await?;
+
+        let prepared = c
+            .prepare(concat!(
+                "insert into scram_credential ",
+                " (username, mechanism, salt, iterations, stored_key, server_key) ",
+                " values",
+                " ($1, $2, $3, $4, $5, $6)",
+                " on conflict (username, mechanism)",
+                " do update set",
+                " salt = excluded.salt",
+                ", iterations = excluded.iterations",
+                ", stored_key = excluded.stored_key",
+                ", server_key = excluded.server_key",
+                ", last_updated = excluded.last_updated",
+            ))
+            .await
+            .inspect_err(|err| error!(?err, ?username, ?mechanism,))?;
+
+        _ = c
+            .execute(
+                &prepared,
+                &[
+                    &username,
+                    &i32::from(mechanism),
+                    &&credential.salt()[..],
+                    &credential.iterations,
+                    &&credential.stored_key()[..],
+                    &&credential.server_key()[..],
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err, ?username, ?mechanism,))?;
+
+        Ok(())
+    }
+
+    async fn user_scram_credential(
+        &self,
+        user: &str,
+        mechanism: ScramMechanism,
+    ) -> Result<Option<ScramCredential>> {
+        let c = self.connection().await?;
+
+        let prepared = c
+            .prepare(concat!(
+                "select from scram_credential",
+                " salt, iterations, stored_key, server_key",
+                " where",
+                " username = $1",
+                ", and mechanism = $2",
+            ))
+            .await
+            .inspect_err(|err| error!(?err, ?user, ?mechanism,))?;
+
+        c.query_opt(&prepared, &[&user, &i32::from(mechanism)])
+            .await
+            .map_err(Into::into)
+            .and_then(|maybe| {
+                if let Some(row) = maybe {
+                    let salt = row.try_get::<_, &[u8]>(0).map(Bytes::copy_from_slice)?;
+                    let iterations = row.try_get::<_, i32>(1)?;
+                    let stored_key = row.try_get::<_, &[u8]>(2).map(Bytes::copy_from_slice)?;
+                    let server_key = row.try_get::<_, &[u8]>(3).map(Bytes::copy_from_slice)?;
+
+                    Ok(Some(ScramCredential::new(
+                        salt, iterations, stored_key, server_key,
+                    )))
+                } else {
+                    Ok(None)
+                }
+            })
+            .inspect_err(|err| error!(?err, ?user, ?mechanism,))
     }
 }
 

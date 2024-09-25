@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod alter_user_scram_credentials;
 pub mod api_versions;
 pub mod create_topic;
 pub mod delete_records;
@@ -26,6 +27,9 @@ pub mod list_offsets;
 pub mod list_partition_reassignments;
 pub mod metadata;
 pub mod produce;
+pub mod sasl;
+pub mod sasl_authenticate;
+pub mod sasl_handshake;
 pub mod telemetry;
 
 use crate::{
@@ -34,6 +38,7 @@ use crate::{
     raft::Applicator,
     Error, Result,
 };
+use alter_user_scram_credentials::AlterUserScramCredentials;
 use api_versions::ApiVersionsRequest;
 use bytes::Bytes;
 use create_topic::CreateTopic;
@@ -47,7 +52,11 @@ use list_offsets::ListOffsetsRequest;
 use list_partition_reassignments::ListPartitionReassignmentsRequest;
 use metadata::MetadataRequest;
 use produce::ProduceRequest;
-use std::io::ErrorKind;
+use rsasl::{config::SASLConfig, prelude::SASLServer};
+use sasl::{Authentication, Callback, Justification};
+use sasl_authenticate::SaslAuthenticate;
+use sasl_handshake::SaslHandshake;
+use std::{io::ErrorKind, sync::Arc};
 use tansu_kafka_sans_io::{broker_registration_request::Listener, Body, Frame, Header};
 use tansu_raft::{Log, Raft};
 use tansu_storage::{BrokerRegistationRequest, Storage};
@@ -111,7 +120,12 @@ where
 
     pub async fn serve(&mut self) -> Result<()> {
         self.register().await?;
-        self.listen().await
+
+        let configuration = SASLConfig::builder()
+            .with_defaults()
+            .with_callback(Callback::with_storage(self.storage.clone()))?;
+
+        self.listen(configuration).await
     }
 
     pub async fn register(&mut self) -> Result<()> {
@@ -138,7 +152,7 @@ where
             .map_err(Into::into)
     }
 
-    pub async fn listen(&self) -> Result<()> {
+    pub async fn listen(&self, configuration: Arc<SASLConfig>) -> Result<()> {
         debug!("listener: {}", self.listener.as_str());
 
         let listener = TcpListener::bind(format!(
@@ -153,9 +167,11 @@ where
             debug!(?addr);
 
             let mut broker = self.clone();
+            let authentication =
+                Authentication::Server(SASLServer::<Justification>::new(configuration.clone()));
 
             _ = tokio::spawn(async move {
-                match broker.stream_handler(stream).await {
+                match broker.stream_handler(stream, authentication).await {
                     Err(ref error @ Error::Io(ref io)) if io.kind() == ErrorKind::UnexpectedEof => {
                         info!(?error);
                     }
@@ -170,7 +186,11 @@ where
         }
     }
 
-    async fn stream_handler(&mut self, mut stream: TcpStream) -> Result<()> {
+    async fn stream_handler(
+        &mut self,
+        mut stream: TcpStream,
+        mut authentication: Authentication,
+    ) -> Result<()> {
         debug!(?stream);
 
         let mut size = [0u8; 4];
@@ -201,11 +221,13 @@ where
                 .inspect_err(|error| error!(?size, ?request, ?error))?;
             debug!(?request);
 
-            let response = self
-                .process_request(&request)
+            let (authentication_response, response) = self
+                .process_request(&request, authentication)
                 .await
                 .inspect_err(|error| error!(?request, ?error))?;
             debug!(?response);
+
+            authentication = authentication_response;
 
             stream
                 .write_all(&response)
@@ -214,7 +236,11 @@ where
         }
     }
 
-    async fn process_request(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+    async fn process_request(
+        &mut self,
+        input: &[u8],
+        authentication: Authentication,
+    ) -> Result<(Authentication, Vec<u8>)> {
         match Frame::request_from_bytes(input)? {
             Frame {
                 header:
@@ -229,8 +255,8 @@ where
                 ..
             } => {
                 debug!(?api_key, ?api_version, ?correlation_id);
-                let body = self
-                    .response_for(client_id.as_deref(), body, correlation_id)
+                let (authentication, body) = self
+                    .response_for(client_id.as_deref(), body, correlation_id, authentication)
                     .await
                     .inspect_err(|err| error!(?err))?;
                 debug!(?body, ?correlation_id);
@@ -242,6 +268,7 @@ where
                 )
                 .inspect_err(|err| error!(?err))
                 .map_err(Into::into)
+                .map(|response| (authentication, response))
             }
 
             _ => unimplemented!(),
@@ -274,10 +301,19 @@ where
         client_id: Option<&str>,
         body: Body,
         correlation_id: i32,
-    ) -> Result<Body> {
+        authentication: Authentication,
+    ) -> Result<(Authentication, Body)> {
         debug!(?body, ?correlation_id);
 
         match body {
+            Body::AlterUserScramCredentialsRequest {
+                deletions,
+                upsertions,
+            } => AlterUserScramCredentials::with_storage(self.storage.clone())
+                .response(deletions, upsertions)
+                .await
+                .map(|response| (authentication, response)),
+
             Body::ApiVersionsRequest {
                 client_software_name,
                 client_software_version,
@@ -285,9 +321,12 @@ where
                 debug!(?client_software_name, ?client_software_version,);
 
                 let api_versions = ApiVersionsRequest;
-                Ok(api_versions.response(
-                    client_software_name.as_deref(),
-                    client_software_version.as_deref(),
+                Ok((
+                    authentication,
+                    api_versions.response(
+                        client_software_name.as_deref(),
+                        client_software_version.as_deref(),
+                    ),
                 ))
             }
 
@@ -300,6 +339,7 @@ where
                 CreateTopic::with_storage(self.storage.clone())
                     .request(topics, validate_only.unwrap_or(false))
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::DeleteRecordsRequest { topics, .. } => {
@@ -308,6 +348,7 @@ where
                 DeleteRecordsRequest::with_storage(self.storage.clone())
                     .request(topics.as_deref().unwrap_or(&[]))
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::DescribeClusterRequest {
@@ -322,6 +363,7 @@ where
                 }
                 .response(include_cluster_authorized_operations, endpoint_type)
                 .await
+                .map(|body| (authentication, body))
             }
 
             Body::DescribeConfigsRequest {
@@ -332,10 +374,13 @@ where
                 debug!(?resources, ?include_synonyms, ?include_documentation,);
 
                 let describe_configs = DescribeConfigsRequest;
-                Ok(describe_configs.response(
-                    resources.as_deref(),
-                    include_synonyms,
-                    include_documentation,
+                Ok((
+                    authentication,
+                    describe_configs.response(
+                        resources.as_deref(),
+                        include_synonyms,
+                        include_documentation,
+                    ),
                 ))
             }
 
@@ -366,6 +411,7 @@ where
                     .await
                     .inspect(|r| debug!(?r))
                     .inspect_err(|error| error!(?error))
+                    .map(|body| (authentication, body))
             }
 
             Body::FindCoordinatorRequest {
@@ -377,19 +423,25 @@ where
 
                 let find_coordinator = FindCoordinatorRequest;
 
-                Ok(find_coordinator.response(
-                    key.as_deref(),
-                    key_type,
-                    coordinator_keys.as_deref(),
-                    self.node_id,
-                    &self.listener,
+                Ok((
+                    authentication,
+                    find_coordinator.response(
+                        key.as_deref(),
+                        key_type,
+                        coordinator_keys.as_deref(),
+                        self.node_id,
+                        &self.listener,
+                    ),
                 ))
             }
 
             Body::GetTelemetrySubscriptionsRequest { client_instance_id } => {
                 debug!(?client_instance_id);
                 let get_telemetry_subscriptions = GetTelemetrySubscriptionsRequest;
-                Ok(get_telemetry_subscriptions.response(client_instance_id))
+                Ok((
+                    authentication,
+                    get_telemetry_subscriptions.response(client_instance_id),
+                ))
             }
 
             Body::HeartbeatRequest {
@@ -408,6 +460,7 @@ where
                         group_instance_id.as_deref(),
                     )
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::InitProducerIdRequest {
@@ -424,11 +477,14 @@ where
                 );
 
                 let init_producer_id = InitProducerIdRequest;
-                Ok(init_producer_id.response(
-                    transactional_id.as_deref(),
-                    transaction_timeout_ms,
-                    producer_id,
-                    producer_epoch,
+                Ok((
+                    authentication,
+                    init_producer_id.response(
+                        transactional_id.as_deref(),
+                        transaction_timeout_ms,
+                        producer_id,
+                        producer_epoch,
+                    ),
                 ))
             }
 
@@ -466,6 +522,7 @@ where
                         reason.as_deref(),
                     )
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::LeaveGroupRequest {
@@ -478,6 +535,7 @@ where
                 self.groups
                     .leave(&group_id, member_id.as_deref(), members.as_deref())
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::ListOffsetsRequest {
@@ -490,6 +548,7 @@ where
                 ListOffsetsRequest::with_storage(self.storage.clone())
                     .response(replica_id, isolation_level, topics.as_deref())
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::ListPartitionReassignmentsRequest { topics, .. } => {
@@ -498,6 +557,7 @@ where
                 ListPartitionReassignmentsRequest::with_storage(self.storage.clone())
                     .response(topics.as_deref())
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::MetadataRequest { topics, .. } => {
@@ -505,6 +565,7 @@ where
                 MetadataRequest::with_storage(self.storage.clone())
                     .response(topics)
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::OffsetCommitRequest {
@@ -533,7 +594,10 @@ where
                     topics: topics.as_deref(),
                 };
 
-                self.groups.offset_commit(detail).await
+                self.groups
+                    .offset_commit(detail)
+                    .await
+                    .map(|body| (authentication, body))
             }
 
             Body::OffsetFetchRequest {
@@ -551,6 +615,7 @@ where
                         require_stable,
                     )
                     .await
+                    .map(|body| (authentication, body))
             }
 
             Body::ProduceRequest {
@@ -563,6 +628,20 @@ where
                 ProduceRequest::with_storage(self.storage.clone())
                     .response(transactional_id, acks, timeout_ms, topic_data)
                     .await
+                    .map(|body| (authentication, body))
+            }
+
+            Body::SaslAuthenticateRequest { auth_bytes } => {
+                debug!(?auth_bytes);
+                let authenticate = SaslAuthenticate;
+
+                authenticate.response(auth_bytes, authentication).await
+            }
+
+            Body::SaslHandshakeRequest { mechanism } => {
+                debug!(?mechanism);
+                let handshake = SaslHandshake;
+                handshake.response(mechanism.as_str(), authentication).await
             }
 
             Body::SyncGroupRequest {
@@ -573,19 +652,19 @@ where
                 protocol_type,
                 protocol_name,
                 assignments,
-            } => {
-                self.groups
-                    .sync(
-                        &group_id,
-                        generation_id,
-                        &member_id,
-                        group_instance_id.as_deref(),
-                        protocol_type.as_deref(),
-                        protocol_name.as_deref(),
-                        assignments.as_deref(),
-                    )
-                    .await
-            }
+            } => self
+                .groups
+                .sync(
+                    &group_id,
+                    generation_id,
+                    &member_id,
+                    group_instance_id.as_deref(),
+                    protocol_type.as_deref(),
+                    protocol_name.as_deref(),
+                    assignments.as_deref(),
+                )
+                .await
+                .map(|body| (authentication, body)),
 
             _ => unimplemented!(),
         }

@@ -287,6 +287,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "core2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1160,6 +1169,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1437,6 +1455,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
+name = "rsasl"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45035615cdd68c71daac89aef75b130d4b2cad29599966e1b4671f8fbb463559"
+dependencies = [
+ "base64",
+ "core2",
+ "digest",
+ "hmac",
+ "pbkdf2",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "stringprep",
+ "thiserror",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1708,14 +1745,17 @@ dependencies = [
  "bytes",
  "clap",
  "deadpool-postgres",
+ "digest",
  "futures",
  "opentelemetry 0.21.0",
  "opentelemetry-jaeger",
  "opentelemetry_sdk 0.21.2",
  "pretty_assertions",
  "rand",
+ "rsasl",
  "serde",
  "serde_json",
+ "sha2",
  "tansu-kafka-model",
  "tansu-kafka-sans-io",
  "tansu-raft",
