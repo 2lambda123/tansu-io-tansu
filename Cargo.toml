@@ -39,7 +39,7 @@ broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
 
 [workspace.dependencies]
-anyhow = "1.0.95"
+anyhow = "1.0.96"
 async-trait = "0.1.85"
 bytes = { version = "1", features = ["serde"] }
 clap = { version = "4.5.28", features = ["derive", "env"] }
